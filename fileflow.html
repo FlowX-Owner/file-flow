@@ -585,6 +585,8 @@
             display: flex;
             align-items: flex-start;
             gap: 10px;
+            white-space: pre-wrap;
+            line-height: 1.5;
         }
 
         .error-card svg {
@@ -975,16 +977,29 @@
             }
         }
 
-        // Optimal STUN servers for rapid direct P2P NAT discovery
+        // Optimal STUN + TURN servers for rapid direct P2P NAT discovery
+        // STUN = tries direct hole punching first (fastest)
+        // TURN = relays traffic if direct connection fails (reliable fallback)
         const ICE_CONFIG = {
             iceServers: [
+                // Primary STUN servers - direct P2P hole punching
                 { urls: 'stun:stun.l.google.com:19302' },
                 { urls: 'stun:stun1.l.google.com:19302' },
                 { urls: 'stun:stun2.l.google.com:19302' },
                 { urls: 'stun:stun3.l.google.com:19302' },
                 { urls: 'stun:stun4.l.google.com:19302' },
-                { urls: 'stun:stun.cloudflare.com:3478' }
-            ]
+                { urls: 'stun:stun.cloudflare.com:3478' },
+                // TURN relay fallback (works through carrier blocks but slower)
+                {
+                    urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443', 'turn:openrelay.metered.ca:80?transport=tcp'],
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
+                }
+            ],
+            // Optimize for hotspot/NAT scenarios
+            iceCandidatePoolSize: 10,
+            // Prefer relay (TURN) candidates as last resort - helps when direct fails
+            iceTransportPolicy: 'all' // 'all' tries everything, 'relay' only TURN
         };
 
         function initSenderPeer() {
@@ -1080,16 +1095,30 @@
             watchIce();
             const iceCheckInterval = setInterval(watchIce, 200);
 
-            // 35-second connection timeout with clear, actionable diagnostics
+            // 60-second connection timeout (double NAT on hotspots needs more time for STUN)
+            let retryAttempt = 0;
             const connTimeout = setTimeout(() => {
                 clearInterval(iceCheckInterval);
                 if (!conn.open) {
-                    setStatus('Connection timed out', 'error');
-                    showError('Could not connect in time. If your laptop is connected to your phone\'s Mobile Hotspot, cellular carriers (Jio, Airtel, Vi) block direct P2P loopback. Try connecting both devices to the same Wi-Fi router, or connect your phone to 5G and laptop to another Wi-Fi.');
-                    try { conn.close(); } catch (_) {}
-                    btnConnect.disabled = false;
+                    retryAttempt++;
+                    if (retryAttempt === 1) {
+                        // First timeout: try one more time
+                        setStatus('Connection taking longer... retrying...', 'waiting');
+                        showError('Connection is taking longer than expected. This happens on mobile hotspots (double NAT). Retrying now...');
+                        try { conn.close(); } catch (_) {}
+                        // Auto-retry the connection
+                        setTimeout(() => {
+                            initJoinerPeer(state.targetCode);
+                        }, 1000);
+                    } else {
+                        // Second timeout: give up with full diagnostics
+                        setStatus('Connection failed', 'error');
+                        showError('⚠️ Could not establish direct P2P connection.\n\n📱 Phone Hotspot Issue: Cellular carriers block P2P loopback when tethering.\n\n✅ Solutions:\n• Both devices on same Wi-Fi router (best)\n• Phone on 5G + laptop on different Wi-Fi\n• Restart both devices and try again\n\nTap "Show my code instead" to swap roles.');
+                        try { conn.close(); } catch (_) {}
+                        btnConnect.disabled = false;
+                    }
                 }
-            }, 35000);
+            }, 60000);
 
             conn.on('open', () => {
                 clearTimeout(connTimeout);
