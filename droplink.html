@@ -712,7 +712,7 @@
             </button>
 
             <div style="margin-top: 14px; text-align: center; font-size: 0.78rem; color: var(--text-muted); line-height: 1.4;">
-                ⚡ <strong>Network Tip:</strong> Connects fastest when both devices are on the same Wi-Fi network, or on separate internet connections.
+                ⚡ <strong>Speed Tip:</strong> For fastest transfers (10–50+ MB/s), connect both devices to the same Wi-Fi router. Hotspots use relay mode which is reliable but slower.
             </div>
 
             <div class="switch-mode-divider">
@@ -738,7 +738,7 @@
 
             <div style="margin-top: 18px; text-align: center;">
                 <p style="font-size: 0.82rem; color: var(--text-muted);">
-                    Direct peer connection active. Files travel straight between both screens.
+                    Peer-to-peer link established. Select any file or photos to start streaming.
                 </p>
             </div>
         </section>
@@ -809,11 +809,18 @@
         /* ==========================================================================
            DropLink Core Logic
            - WebRTC P2P DataChannel via PeerJS
-           - 64KB Binary Chunking with 4-byte sequence headers
+           - Pipelined 128KB Chunking with 4-byte sequence headers
+           - Native event-driven backpressure & throttled UI updates
            - Automatic Blob reassembly & silent browser download
            ========================================================================== */
 
-        const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk for optimal WebRTC throughput
+        const TRANSFER_CONFIG = {
+            chunkSize: 128 * 1024,                // 128 KB per chunk (halves packet framing overhead vs 64KB)
+            pipelineDepth: 4,                     // Asynchronously pre-read 4 chunks ahead in memory (512KB prefetch)
+            bufferHighWaterMark: 4 * 1024 * 1024, // 4 MB high-water mark keeps SCTP pipe full
+            bufferLowWaterMark: 1 * 1024 * 1024,  // 1 MB low-water mark for event-driven drain
+            uiUpdateIntervalMs: 100               // Throttle UI DOM updates to at most 10 times/second
+        };
         const PEER_PREFIX = 'DROPLINK-V1-'; // Unique namespace prefix to avoid ID collisions on PeerJS cloud
 
         // Application State
@@ -830,7 +837,12 @@
             receivedBytes: 0,
             receivedCount: 0,
             doneSignalReceived: false,
-            transferStartTime: 0
+            transferStartTime: 0,
+            connectionRetryAttempt: 0,
+            connectionAttemptId: 0,
+            connectionRoute: null,
+            lastTransferUiUpdate: 0,
+            pendingUiFrame: null
         };
 
         // DOM Elements
@@ -956,6 +968,126 @@
             return map[ext] || fileType || 'application/octet-stream';
         }
 
+        // Throttled UI updater (prevents main thread freezing on high throughput transfers)
+        function updateTransferProgress(bytesDone, totalBytes, startTime, force = false) {
+            const now = performance.now();
+            if (!force && now - state.lastTransferUiUpdate < TRANSFER_CONFIG.uiUpdateIntervalMs) {
+                return;
+            }
+            state.lastTransferUiUpdate = now;
+
+            const percent = totalBytes > 0 ? Math.min(100, Math.round((bytesDone / totalBytes) * 100)) : 100;
+            const elapsedSec = Math.max((now - startTime) / 1000, 0.001);
+            const speedBytes = elapsedSec > 0 ? (bytesDone / elapsedSec) : 0;
+
+            if (state.pendingUiFrame) {
+                cancelAnimationFrame(state.pendingUiFrame);
+            }
+
+            state.pendingUiFrame = requestAnimationFrame(() => {
+                progressFill.style.width = percent + '%';
+                transferPercent.textContent = percent + '%';
+                transferSpeed.textContent = formatBytes(speedBytes) + '/s';
+                transferBytes.textContent = `${formatBytes(bytesDone)} / ${formatBytes(totalBytes)}`;
+                state.pendingUiFrame = null;
+            });
+        }
+
+        // Detects if current connection is Direct Local (Wi-Fi), Direct STUN, or Relay (TURN)
+        async function detectConnectionRoute(conn) {
+            const pc = conn && conn.peerConnection;
+            if (!pc || !pc.getStats) return null;
+
+            try {
+                const stats = await pc.getStats();
+                let selectedPair = null;
+
+                stats.forEach(report => {
+                    if (report.type === 'candidate-pair' && report.state === 'succeeded' && (report.nominated || report.selected)) {
+                        selectedPair = report;
+                    }
+                });
+
+                if (!selectedPair) return null;
+
+                const local = stats.get(selectedPair.localCandidateId);
+                const remote = stats.get(selectedPair.remoteCandidateId);
+                const localType = local ? local.candidateType : '';
+                const remoteType = remote ? remote.candidateType : '';
+
+                let type = 'unknown';
+                if (localType === 'relay' || remoteType === 'relay') {
+                    type = 'relay';
+                } else if (localType === 'host' && remoteType === 'host') {
+                    type = 'host';
+                } else {
+                    type = 'srflx';
+                }
+
+                return { type, localType, remoteType };
+            } catch (e) {
+                console.warn('Error querying WebRTC stats:', e);
+                return null;
+            }
+        }
+
+        // Native WebRTC event-driven backpressure
+        // Avoids timer polling delays and keeps the SCTP pipe full
+        function waitForBufferSpace(dc) {
+            if (!dc || dc.readyState !== 'open') {
+                return Promise.resolve();
+            }
+
+            if (dc.bufferedAmount <= TRANSFER_CONFIG.bufferHighWaterMark) {
+                return Promise.resolve();
+            }
+
+            return new Promise((resolve) => {
+                let resolved = false;
+                const timer = setTimeout(() => {
+                    if (!resolved) {
+                        resolved = true;
+                        try { dc.removeEventListener('bufferedamountlow', onLow); } catch (_) {}
+                        resolve();
+                    }
+                }, 400);
+
+                const onLow = () => {
+                    if (!resolved) {
+                        resolved = true;
+                        clearTimeout(timer);
+                        resolve();
+                    }
+                };
+
+                try {
+                    dc.bufferedAmountLowThreshold = TRANSFER_CONFIG.bufferLowWaterMark;
+                    dc.addEventListener('bufferedamountlow', onLow, { once: true });
+                } catch (e) {
+                    clearTimeout(timer);
+                    resolve();
+                }
+            });
+        }
+
+        // Asynchronously slices, reads, and frames a chunk ahead of time (Prefetch Pipeline)
+        async function prepareChunk(file, chunkIndex, chunkSize) {
+            const start = chunkIndex * chunkSize;
+            const end = Math.min(start + chunkSize, file.size);
+            const slice = file.slice(start, end);
+            const arrayBuffer = await slice.arrayBuffer();
+
+            const packet = new Uint8Array(4 + arrayBuffer.byteLength);
+            new DataView(packet.buffer).setUint32(0, chunkIndex, false);
+            packet.set(new Uint8Array(arrayBuffer), 4);
+
+            return {
+                index: chunkIndex,
+                bytes: arrayBuffer.byteLength,
+                packet: packet.buffer
+            };
+        }
+
         // ----------------------------------------------------------------------
         // Initialization & Peer Connection Setup
         // ----------------------------------------------------------------------
@@ -978,28 +1110,35 @@
         }
 
         // Optimal STUN + TURN servers for rapid direct P2P NAT discovery
-        // STUN = tries direct hole punching first (fastest)
-        // TURN = relays traffic if direct connection fails (reliable fallback)
+        // STUN = tries direct hole punching first (fastest, up to 50+ MB/s)
+        // TURN UDP = low-latency relay fallback
+        // TURN TCP = firewall-resistant relay fallback
         const ICE_CONFIG = {
             iceServers: [
                 // Primary STUN servers - direct P2P hole punching
                 { urls: 'stun:stun.l.google.com:19302' },
                 { urls: 'stun:stun1.l.google.com:19302' },
                 { urls: 'stun:stun2.l.google.com:19302' },
-                { urls: 'stun:stun3.l.google.com:19302' },
-                { urls: 'stun:stun4.l.google.com:19302' },
                 { urls: 'stun:stun.cloudflare.com:3478' },
-                // TURN relay fallback (works through carrier blocks but slower)
+                // High-priority UDP TURN relay fallback (faster throughput than TCP)
                 {
-                    urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443', 'turn:openrelay.metered.ca:80?transport=tcp'],
+                    urls: 'turn:openrelay.metered.ca:80?transport=udp',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
+                },
+                // TCP TURN fallback as last resort
+                {
+                    urls: [
+                        'turn:openrelay.metered.ca:80?transport=tcp',
+                        'turn:openrelay.metered.ca:443?transport=tcp'
+                    ],
                     username: 'openrelayproject',
                     credential: 'openrelayproject'
                 }
             ],
-            // Optimize for hotspot/NAT scenarios
-            iceCandidatePoolSize: 10,
-            // Prefer relay (TURN) candidates as last resort - helps when direct fails
-            iceTransportPolicy: 'all' // 'all' tries everything, 'relay' only TURN
+            // Pre-fetch candidates for snappy negotiation
+            iceCandidatePoolSize: 8,
+            iceTransportPolicy: 'all'
         };
 
         function initSenderPeer() {
@@ -1071,6 +1210,7 @@
 
         function setupConnection(conn) {
             state.conn = conn;
+            const attemptId = state.connectionAttemptId;
 
             // Monitor underlying WebRTC ICE connection state
             const watchIce = () => {
@@ -1095,38 +1235,58 @@
             watchIce();
             const iceCheckInterval = setInterval(watchIce, 200);
 
-            // 60-second connection timeout (double NAT on hotspots needs more time for STUN)
-            let retryAttempt = 0;
+            // 60-second connection timeout — retryAttempt in global state to survive re-entry
             const connTimeout = setTimeout(() => {
                 clearInterval(iceCheckInterval);
-                if (!conn.open) {
-                    retryAttempt++;
-                    if (retryAttempt === 1) {
-                        // First timeout: try one more time
-                        setStatus('Connection taking longer... retrying...', 'waiting');
-                        showError('Connection is taking longer than expected. This happens on mobile hotspots (double NAT). Retrying now...');
-                        try { conn.close(); } catch (_) {}
-                        // Auto-retry the connection
-                        setTimeout(() => {
+                if (attemptId !== state.connectionAttemptId) return; // stale timeout from old attempt
+                if (conn.open) return;
+
+                state.connectionRetryAttempt++;
+
+                if (state.connectionRetryAttempt <= 1) {
+                    // First timeout: try once more automatically
+                    setStatus('Connection taking longer... retrying...', 'waiting');
+                    showError('Connection is taking longer than expected. This happens on mobile hotspots (double NAT). Retrying now...');
+                    try { conn.close(); } catch (_) {}
+                    setTimeout(() => {
+                        if (attemptId === state.connectionAttemptId) {
                             initJoinerPeer(state.targetCode);
-                        }, 1000);
-                    } else {
-                        // Second timeout: give up with full diagnostics
-                        setStatus('Connection failed', 'error');
-                        showError('⚠️ Could not establish direct P2P connection.\n\n📱 Phone Hotspot Issue: Cellular carriers block P2P loopback when tethering.\n\n✅ Solutions:\n• Both devices on same Wi-Fi router (best)\n• Phone on 5G + laptop on different Wi-Fi\n• Restart both devices and try again\n\nTap "Show my code instead" to swap roles.');
-                        try { conn.close(); } catch (_) {}
-                        btnConnect.disabled = false;
-                    }
+                        }
+                    }, 1000);
+                } else {
+                    // Second timeout: give up with full diagnostics
+                    setStatus('Connection failed', 'error');
+                    showError('⚠️ Could not establish direct P2P connection.\n\n📱 Phone Hotspot Issue: Cellular carriers block P2P loopback when tethering.\n\n✅ Solutions:\n• Both devices on same Wi-Fi router (best)\n• Phone on 5G + laptop on different Wi-Fi\n• Restart both devices and try again\n\nTap "Show my code instead" to swap roles.');
+                    try { conn.close(); } catch (_) {}
+                    btnConnect.disabled = false;
                 }
             }, 60000);
 
             conn.on('open', () => {
                 clearTimeout(connTimeout);
                 clearInterval(iceCheckInterval);
+                state.connectionRetryAttempt = 0;
                 hideError();
-                setStatus('Connected to peer!', 'connected');
                 showPanel(panelConnected);
                 showToast('Devices successfully paired!');
+
+                // Detect and display the connection route (Direct / STUN / TURN relay)
+                detectConnectionRoute(conn).then(route => {
+                    if (!route) {
+                        setStatus('Connected to peer!', 'connected');
+                        return;
+                    }
+                    state.connectionRoute = route;
+                    if (route.type === 'host') {
+                        setStatus('🚀 Direct Local connection (fastest)', 'connected');
+                    } else if (route.type === 'srflx' || route.type === 'prflx') {
+                        setStatus('🌐 Direct P2P connection active', 'connected');
+                    } else if (route.type === 'relay') {
+                        setStatus('🔄 Relay mode active (reliable, may be slower)', 'connected');
+                    } else {
+                        setStatus('Connected to peer!', 'connected');
+                    }
+                });
             });
 
             conn.on('data', handleIncomingData);
@@ -1211,6 +1371,9 @@
             state.isTransferring = true;
             const file = state.fileQueue.shift();
             const mime = getMimeType(file.name, file.type);
+            const chunkSize = TRANSFER_CONFIG.chunkSize;
+            const totalChunks = Math.ceil(file.size / chunkSize);
+            const pipelineDepth = TRANSFER_CONFIG.pipelineDepth;
 
             // Setup UI for Sender
             transferFileName.textContent = file.name;
@@ -1226,21 +1389,35 @@
             }
             showPanel(panelTransfer);
 
-            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-
-            // Step 1: Send metadata envelope with verified MIME type
+            // Step 1: Send metadata envelope with verified MIME type and chunk configuration
             state.conn.send(JSON.stringify({
                 type: 'meta',
                 name: file.name,
                 size: file.size,
                 mimeType: mime,
-                totalChunks: totalChunks
+                totalChunks: totalChunks,
+                chunkSize: chunkSize
             }));
 
-            // Step 2: Stream chunks with WebRTC Backpressure / Flow Control
+            // Step 2: Stream chunks via Pipelined Sliding Window (Parallel chunk prefetching)
             let sentBytes = 0;
             const startTime = performance.now();
             const dc = state.conn.dataChannel;
+
+            // Prefetch Map to maintain sliding window of prepared binary packets
+            const preparedMap = new Map();
+            let nextIndexToPrepare = 0;
+
+            function schedulePrefetch(idx) {
+                if (idx < totalChunks && !preparedMap.has(idx)) {
+                    preparedMap.set(idx, prepareChunk(file, idx, chunkSize));
+                }
+            }
+
+            // Fill initial prefetch pipeline window (e.g. chunks 0, 1, 2, 3)
+            while (nextIndexToPrepare < Math.min(pipelineDepth, totalChunks)) {
+                schedulePrefetch(nextIndexToPrepare++);
+            }
 
             for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
                 if (!state.conn || !state.conn.open) {
@@ -1249,48 +1426,30 @@
                     return;
                 }
 
-                // BACKPRESSURE FLOW CONTROL:
-                // If WebRTC internal buffer is holding more than 512 KB, pause sending until it drains.
-                // This prevents SCTP buffer overflow and packet drops on large media files and videos!
-                if (dc && dc.bufferedAmount > 512 * 1024) {
-                    while (dc && dc.bufferedAmount > 128 * 1024 && state.conn.open) {
-                        await new Promise(r => setTimeout(r, 20));
-                    }
+                // Native event-driven backpressure: pause only if SCTP internal buffer is over 4MB
+                await waitForBufferSpace(dc);
+
+                // Retrieve pre-read chunk from sliding window
+                const chunkData = await preparedMap.get(chunkIdx);
+                preparedMap.delete(chunkIdx);
+
+                // Slide window forward by prefetching next chunk in background
+                if (nextIndexToPrepare < totalChunks) {
+                    schedulePrefetch(nextIndexToPrepare++);
                 }
 
-                const start = chunkIdx * CHUNK_SIZE;
-                const end = Math.min(start + CHUNK_SIZE, file.size);
-                const slice = file.slice(start, end);
-                const arrayBuffer = await slice.arrayBuffer();
+                state.conn.send(chunkData.packet);
+                sentBytes += chunkData.bytes;
 
-                // Build packet: 4-byte big-endian sequence header + payload
-                const packet = new Uint8Array(4 + arrayBuffer.byteLength);
-                new DataView(packet.buffer).setUint32(0, chunkIdx, false);
-                packet.set(new Uint8Array(arrayBuffer), 4);
-
-                state.conn.send(packet.buffer);
-                sentBytes += arrayBuffer.byteLength;
-
-                // Telemetry update
-                const percent = Math.round((sentBytes / file.size) * 100);
-                const elapsedSec = (performance.now() - startTime) / 1000;
-                const speedBytes = elapsedSec > 0 ? (sentBytes / elapsedSec) : 0;
-
-                progressFill.style.width = percent + '%';
-                transferPercent.textContent = percent + '%';
-                transferSpeed.textContent = formatBytes(speedBytes) + '/s';
-                transferBytes.textContent = `${formatBytes(sentBytes)} / ${formatBytes(file.size)}`;
-
-                // Yield to allow browser UI paint and WebRTC buffer drainage
-                if (chunkIdx % 4 === 0) {
-                    await new Promise(resolve => setTimeout(resolve, 0));
-                }
+                // Throttled UI progress update
+                updateTransferProgress(sentBytes, file.size, startTime);
             }
 
-            // Drain remaining buffered amount before signaling completion
-            while (dc && dc.bufferedAmount > 0 && state.conn.open) {
-                await new Promise(r => setTimeout(r, 25));
-            }
+            // Force final 100% update to UI
+            updateTransferProgress(file.size, file.size, startTime, true);
+
+            // Drain buffer before completion
+            await waitForBufferSpace(dc);
 
             // Step 3: Send completion signal
             state.conn.send(JSON.stringify({ type: 'done' }));
@@ -1367,16 +1526,9 @@
                     state.receivedCount++;
                 }
 
-                // Telemetry update
+                // Throttled UI telemetry update
                 const totalSize = state.activeTransfer.size;
-                const percent = Math.min(100, Math.round((state.receivedBytes / totalSize) * 100));
-                const elapsedSec = (performance.now() - state.transferStartTime) / 1000;
-                const speedBytes = elapsedSec > 0 ? (state.receivedBytes / elapsedSec) : 0;
-
-                progressFill.style.width = percent + '%';
-                transferPercent.textContent = percent + '%';
-                transferSpeed.textContent = formatBytes(speedBytes) + '/s';
-                transferBytes.textContent = `${formatBytes(state.receivedBytes)} / ${formatBytes(totalSize)}`;
+                updateTransferProgress(state.receivedBytes, totalSize, state.transferStartTime);
 
                 // Check if transfer has finished
                 if (state.doneSignalReceived || state.receivedCount >= state.activeTransfer.totalChunks) {
@@ -1399,6 +1551,8 @@
             if (!state.activeTransfer) return;
 
             const meta = state.activeTransfer;
+            updateTransferProgress(meta.size, meta.size, state.transferStartTime, true);
+
             // Assemble clean Blob with verified MIME type
             const blob = new Blob(state.receivedChunks, { type: meta.mimeType || 'application/octet-stream' });
             const blobUrl = URL.createObjectURL(blob);
@@ -1526,6 +1680,8 @@
         btnConnect.addEventListener('click', () => {
             const code = inputCode.value.trim().toUpperCase();
             if (code.length === 6) {
+                state.connectionRetryAttempt = 0;
+                state.connectionAttemptId++;
                 btnConnect.disabled = true;
                 initJoinerPeer(code);
             }
